@@ -1,14 +1,7 @@
-﻿using ResMerger;
-using System;
+﻿using System;
 using System.Collections.Generic;
-using System.Diagnostics;
 using System.IO;
 using System.Linq;
-using System.Text;
-using System.Threading.Tasks;
-using System.Windows;
-using System.Windows.Markup;
-using System.Xml;
 using System.Xml.Linq;
 
 /*
@@ -128,8 +121,11 @@ namespace ResMerger
             var documents = new Dictionary<string, Data>();
           
             // add elements
-            ResourceMerger.PrepareDocuments(ref documents, projectPath, projectName, relativeSourceFilePath);
+            var existingNamespaces = new List<Namespace>();
+            ResourceMerger.PrepareDocuments(ref documents, projectPath, projectName, relativeSourceFilePath, existingNamespaces);
        
+            var existingKeys = new HashSet<string>();
+
             // add elements (ordered by dependency count)
             foreach (var item in documents.OrderByDescending(item => item.Value.DependencyCount))
             {
@@ -137,8 +133,16 @@ namespace ResMerger
                 foreach (var attribute in item.Value.Document.Root.Attributes())
                     outputDoc.Root.SetAttributeValue(attribute.Name, attribute.Value);
 
-                // add elements
-                outputDoc.Root.Add(item.Value.Document.Root.Elements().Where(e => !e.Name.LocalName.StartsWith(resDictString)));
+                var elements = item.Value.Document.Root.Elements().Where(e => !e.Name.LocalName.StartsWith(resDictString));
+                var elementKeys = elements.Select(e => GetKey(e));
+                
+                // TODO: not sure about this part. our xamls contained duplicate keys such as "BooleanToVisibilityConverter".
+                //       obviously we need only one of them. but if two keys actually reference completely different things, this might be a bad idea
+                //       better warn the user and let him fix it?
+                outputDoc.Root.Add(elements.Where(e => !existingKeys.Contains(GetKey(e))));
+
+                existingKeys.UnionWith(elementKeys);
+                existingKeys.ExceptWith(new string[] {null});
             }
 
             using (var ms = new MemoryStream())
@@ -151,6 +155,13 @@ namespace ResMerger
 
             // save file
             outputDoc.Save(projectPath + relativeOutputFilePath);
+        }
+
+        private static string GetKey(XElement xamlElement)
+        {
+            var xamlNamespace = XNamespace.Get("http://schemas.microsoft.com/winfx/2006/xaml");
+            // TODO what about TargetType? (templating by type might also happen in more than one file)
+            return xamlElement.Attribute(xamlNamespace + "Key")?.Value;
         }
 
         private static bool OutputEqualsExistingFileContent(string targetFileName, IEnumerable<byte> newFileContent)
@@ -172,13 +183,15 @@ namespace ResMerger
         /// <param name="projectPath">project path</param>
         /// <param name="projectName">project name</param>
         /// <param name="relativeSourceFilePath">relative source file path</param>
-        /// <param name="resDictString">resource dictionary string (node name)</param>
+        /// <param name="existingNamespaces"></param>
         /// <param name="firstTime">first time, is LookAndFeel?</param>
         /// <param name="parentDependencyCount">dependency count</param>
-        private static void PrepareDocuments(ref Dictionary<string, Data> documents, string projectPath, string projectName, string relativeSourceFilePath, bool firstTime = true, int parentDependencyCount = 0)
+        /// <param name="resDictString">resource dictionary string (node name)</param>
+        private static void PrepareDocuments(ref Dictionary<string, Data> documents, string projectPath, string projectName,
+            string relativeSourceFilePath, List<Namespace> existingNamespaces, bool firstTime = true, int parentDependencyCount = 0)
         {
             // load current doc
-            var absoluteSourceFilePath = projectPath + relativeSourceFilePath;
+            var absoluteSourceFilePath = Path.Combine(projectPath, relativeSourceFilePath);
 
             // if file does not exist throw exception
             if (!File.Exists(absoluteSourceFilePath))
@@ -186,6 +199,8 @@ namespace ResMerger
 
             // load the doc
             var doc = XDocument.Load(absoluteSourceFilePath);
+
+            DisambiguateNamespaces(doc, existingNamespaces);
 
             // get the corresponding res dict name
             var resDictString = doc.Root.Name.LocalName;
@@ -195,13 +210,113 @@ namespace ResMerger
 
             // if key already added increase dependency count else add item with dependency count set to 0
             if (documents.ContainsKey(absoluteSourceFilePath))
-                documents[absoluteSourceFilePath].DependencyCount = Math.Max(documents[absoluteSourceFilePath].DependencyCount + 1, parentDependencyCount + 1);
+                documents[absoluteSourceFilePath].DependencyCount =
+                    Math.Max(documents[absoluteSourceFilePath].DependencyCount + 1, parentDependencyCount + 1);
             else
                 documents.Add(absoluteSourceFilePath, new Data(doc, firstTime ? -1 : parentDependencyCount + 1));
 
+            var relativeDirectoryPath = Path.GetDirectoryName(relativeSourceFilePath);
+
             // call PrepareDocuments() for each merged dictionary
             foreach (var dict in doc.Root.Descendants(defaultNameSpace + resDictString))
-                PrepareDocuments(ref documents, projectPath, projectName, dict.Attribute("Source").Value.Replace("/" + projectName + ";component/", string.Empty), false, documents[absoluteSourceFilePath].DependencyCount);
+            {
+                if (dict.Attribute("Source") != null)
+                {
+                    // TODO this is a hack because we can't follow pack links.
+                    //      but obviously we will need to add them in the flattened dictionary. (for the example case I did that manually)
+                    if (dict.Attribute("Source").Value.StartsWith("pack"))
+                        continue;
+
+                    PrepareDocuments(
+                        ref documents,
+                        Path.Combine(projectPath, relativeDirectoryPath),
+                        projectName,
+                        dict.Attribute("Source").Value.Replace("/" + projectName + ";component/", string.Empty),
+                        existingNamespaces,
+                        false,
+                        documents[absoluteSourceFilePath].DependencyCount);
+                }
+            }
+        }
+
+        class Namespace
+        {
+            public string Name;
+            public string Value;
+        }
+
+        private static void DisambiguateNamespaces(XDocument doc, IList<Namespace> existingNamespaces)
+        {
+            var namespaces = doc.Root.Attributes().Where(a => a.IsNamespaceDeclaration)
+                .Select(ns => new Namespace { Name= ns.Name.LocalName, Value = ns.Value}).ToList();
+
+            var replacementNamespaces = new Dictionary<string, Namespace>();
+            foreach(var ns in namespaces)
+            {
+                if (existingNamespaces.Any(ens => ens.Name == ns.Name && ens.Value != ns.Value))
+                {
+                    // if we want to go with approach number 1 from 14553#comment:2 then we don't need this. just report the clash and let the user fix it
+                    replacementNamespaces[ns.Name] =
+                        // use an existing prefix if there is one to avoid lots of redundant namespaces (not strictly necessary, but generates a nicer xaml)
+                        existingNamespaces.FirstOrDefault(rns => rns.Value == ns.Value)
+                        ?? new Namespace
+                        {
+                            Name = NameGenerator(ns.Name)
+                                .First(newName => existingNamespaces.Concat(replacementNamespaces.Values).All(v => v.Name != newName)),
+                            Value = ns.Value
+                        };
+                }
+            }
+
+            // this is also not necessary if we use approach number 1
+            ReplaceNamespaceAliases(doc, replacementNamespaces);
+
+            // this _is_ necessary for approach number 1 (minus the replacements)
+            foreach (var ns in namespaces
+                // prevent duplicates
+                .Where(ns => existingNamespaces.All(ens => ens.Name != ns.Name))
+                // don't add the namespaces that we've replaced
+                .Where(ns => replacementNamespaces.Keys.All(k => k != ns.Name))
+                // but add the ones that we've replaced
+                .Concat(replacementNamespaces.Values))
+            {
+                if(!existingNamespaces.Contains(ns))
+                    existingNamespaces.Add(ns);
+            }
+        }
+
+        private static void ReplaceNamespaceAliases(XDocument doc, Dictionary<string, Namespace> replacementNamespaces)
+        {
+            foreach (var nsAttrib in doc.Root.Attributes().Where(a => a.IsNamespaceDeclaration))
+            {
+                var replacement = replacementNamespaces.SingleOrDefault(rns => rns.Key == nsAttrib.Name.LocalName).Value;
+                if (replacement != null)
+                {
+                    nsAttrib.Remove();
+                    doc.Root.Add(new XAttribute(XNamespace.Xmlns + replacement.Name, replacement.Value));
+                    // TODO not sure if this is necessary. the namespace seems to be applied magically anyway? (output files didn't show any difference when this was commented out)
+                    RewriteNamespaceOnElements(doc.Root, replacementNamespaces);
+                }
+            }
+        }
+
+        private static void RewriteNamespaceOnElements(XElement e, Dictionary<string, Namespace> replacementNamespaces)
+        {
+            foreach (XElement element in e.DescendantNodesAndSelf().OfType<XElement>())
+            {
+                var replacement = replacementNamespaces.SingleOrDefault(rns => rns.Value.Value == element.Name.NamespaceName).Value;
+                if (replacement != null)
+                {
+                    e.Name = XNamespace.Xmlns + replacement.Name + e.Name.LocalName;
+                }
+            }
+        }
+
+        private static IEnumerable<string> NameGenerator(string baseName)
+        {
+            int i = 0;
+            while(true)
+                yield return baseName + ++i;
         }
     }
 }
