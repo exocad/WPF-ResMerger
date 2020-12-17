@@ -83,58 +83,36 @@ namespace ResMerger
         /// <param name="resDictString">resource dictionary string (node name)</param>
         public static void MergeResources(string projectPath, string projectName = null, string relativeSourceFilePath = "/LookAndFeel.xaml", string relativeOutputFilePath = "/FullLookAndFeel.xaml")
         {
-            // if project path does not exist throw exception
             if (!Directory.Exists(projectPath))
                 Helpers.ThrowException<Exception>(PROJECT_PATH_EXCEPTION);
 
-            // Get default values for optional parameters
             projectName = string.IsNullOrEmpty(projectName) ? Path.GetFileName(Path.GetDirectoryName(projectPath)) : projectName;
 
-            // if relativeSourceFilePath is not of type .xaml throw exception
             if (!relativeSourceFilePath.EndsWith(".xaml", StringComparison.InvariantCultureIgnoreCase))
                 Helpers.ThrowException<Exception>(SOURCE_TYPE_EXCEPTION);
 
-            // if relativeOutputFilePath is not of type .xaml throw exception
             if (!relativeOutputFilePath.EndsWith(".xaml", StringComparison.InvariantCultureIgnoreCase))
                 Helpers.ThrowException<Exception>(OUTPUT_TYPE_EXCEPTION);
 
-            // create sourceFilePath
-            var sourceFilePath = projectPath + relativeSourceFilePath;
-
-            // if source file does not exist throw exception
-            if (!File.Exists(sourceFilePath))
-                Helpers.ThrowException<Exception>(SOURCE_EXCEPTION + sourceFilePath);
-
-            // load source doc
-            var sourceDoc = XDocument.Load(sourceFilePath);
-
-            // get default namespace for doc creation and filtering
-            var defaultNameSpace = sourceDoc.Root.GetDefaultNamespace();
-
-            // get res dict string
-            var resDictString = sourceDoc.Root.Name.LocalName;
-
-            // create output doc
-            var outputDoc = XDocument.Parse("<" + resDictString + " xmlns=\"" + defaultNameSpace + "\"/>");
-
-            // create documents
             var documents = new Dictionary<string, Data>();
-          
-            // add elements
             var existingNamespaces = new List<Namespace>();
-            ResourceMerger.PrepareDocuments(ref documents, projectPath, projectName, relativeSourceFilePath, existingNamespaces);
+            ResourceMerger.PrepareDocuments(documents, projectPath, projectName, relativeSourceFilePath, existingNamespaces);
        
             var existingKeys = new HashSet<string>();
 
-            // add elements (ordered by dependency count)
+            var sourceDoc = LoadDocument(projectPath, relativeSourceFilePath);
+            var resDictString = sourceDoc.Root.Name.LocalName;
+            var defaultNameSpace = sourceDoc.Root.GetDefaultNamespace();
+            var outputDoc = XDocument.Parse("<" + resDictString + " xmlns=\"" + defaultNameSpace + "\"/>");
+            
             foreach (var item in documents.OrderByDescending(item => item.Value.DependencyCount))
             {
                 // add attributes
                 foreach (var attribute in item.Value.Document.Root.Attributes())
                     outputDoc.Root.SetAttributeValue(attribute.Name, attribute.Value);
 
-                var elements = item.Value.Document.Root.Elements().Where(e => !e.Name.LocalName.StartsWith(resDictString));
-                var elementKeys = elements.Select(e => GetKey(e));
+                var elements = item.Value.Document.Root.Elements().Where(e => !e.Name.LocalName.StartsWith(resDictString)).ToList();
+                var elementKeys = elements.Select(GetKey);
                 
                 // TODO: not sure about this part. our xamls contained duplicate keys such as "BooleanToVisibilityConverter".
                 //       obviously we need only one of them. but if two keys actually reference completely different things, this might be a bad idea
@@ -149,12 +127,22 @@ namespace ResMerger
             {
                 outputDoc.Save(ms);
 
+                // TODO: I don't think we need this. If we include this into our build process, we don't wanna waste time
                 if (OutputEqualsExistingFileContent(Path.Combine(projectPath, relativeOutputFilePath), ms.ToArray()))
                     return;
             }
 
-            // save file
             outputDoc.Save(projectPath + relativeOutputFilePath);
+        }
+
+        private static XDocument LoadDocument(string projectPath, string relativeSourceFilePath)
+        {
+            var sourceFilePath = projectPath + relativeSourceFilePath;
+            
+            if (!File.Exists(sourceFilePath))
+                Helpers.ThrowException<Exception>(SOURCE_EXCEPTION + sourceFilePath);
+
+            return XDocument.Load(sourceFilePath);
         }
 
         private static string GetKey(XElement xamlElement)
@@ -186,27 +174,15 @@ namespace ResMerger
         /// <param name="existingNamespaces"></param>
         /// <param name="firstTime">first time, is LookAndFeel?</param>
         /// <param name="parentDependencyCount">dependency count</param>
-        /// <param name="resDictString">resource dictionary string (node name)</param>
-        private static void PrepareDocuments(ref Dictionary<string, Data> documents, string projectPath, string projectName,
+        private static void PrepareDocuments(Dictionary<string, Data> documents, string projectPath, string projectName,
             string relativeSourceFilePath, List<Namespace> existingNamespaces, bool firstTime = true, int parentDependencyCount = 0)
         {
-            // load current doc
             var absoluteSourceFilePath = Path.Combine(projectPath, relativeSourceFilePath);
-
-            // if file does not exist throw exception
             if (!File.Exists(absoluteSourceFilePath))
                 Helpers.ThrowException<Exception>(FILE_EXCEPTION + absoluteSourceFilePath);
-
-            // load the doc
             var doc = XDocument.Load(absoluteSourceFilePath);
 
             DisambiguateNamespaces(doc, existingNamespaces);
-
-            // get the corresponding res dict name
-            var resDictString = doc.Root.Name.LocalName;
-
-            // get default namespace
-            var defaultNameSpace = doc.Root.GetDefaultNamespace();
 
             // if key already added increase dependency count else add item with dependency count set to 0
             if (documents.ContainsKey(absoluteSourceFilePath))
@@ -218,7 +194,7 @@ namespace ResMerger
             var relativeDirectoryPath = Path.GetDirectoryName(relativeSourceFilePath);
 
             // call PrepareDocuments() for each merged dictionary
-            foreach (var dict in doc.Root.Descendants(defaultNameSpace + resDictString))
+            foreach (var dict in doc.Root.Descendants(doc.Root.GetDefaultNamespace() + doc.Root.Name.LocalName))
             {
                 if (dict.Attribute("Source") != null)
                 {
@@ -228,7 +204,7 @@ namespace ResMerger
                         continue;
 
                     PrepareDocuments(
-                        ref documents,
+                        documents,
                         Path.Combine(projectPath, relativeDirectoryPath),
                         projectName,
                         dict.Attribute("Source").Value.Replace("/" + projectName + ";component/", string.Empty),
@@ -285,6 +261,7 @@ namespace ResMerger
             }
         }
 
+        // TODO: if we want to go with approach number 2, we will have to also replace namespaces in values, i.e. we must parse binding syntax
         private static void ReplaceNamespaceAliases(XDocument doc, Dictionary<string, Namespace> replacementNamespaces)
         {
             foreach (var nsAttrib in doc.Root.Attributes().Where(a => a.IsNamespaceDeclaration))
